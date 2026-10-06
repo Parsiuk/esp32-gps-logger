@@ -8,7 +8,7 @@ stops logging and uploads the finished tracks to a
 ## Features
 
 - Reads NMEA (`RMC`, `GGA`, `GSA`, `GSV`) from a u-blox NEO-6M/7M/8M over UART, with checksum validation.
-- Logs one point per second to GPX 1.1 files named `/gpx/YYYYMMDD_HHMMSS.gpx`.
+- Samples the position every second and records a point only after moving more than 10 m from the last recorded one, to GPX 1.1 files named `/gpx/YYYYMMDD_HHMMSS.gpx`.
 - Power-loss safe: each file is always a complete GPX document, written in batches every 60 s (LittleFS commits on close).
 - Short fix losses start a new track segment; a gap over 5 minutes starts a new file.
 - Keeps 32 kB of flash free; stops logging when full.
@@ -100,7 +100,8 @@ Constants at the top of `gps_logger.py`:
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
-| `SAMPLE` | 1000 ms | Interval between recorded points |
+| `SAMPLE` | 1000 ms | Interval between position samples |
+| `MIN_MOVE` | 10 m | Distance from the last recorded point before a new one is recorded |
 | `FLUSH` | 60000 ms | Interval between flash writes |
 | `NEW_FILE_GAP` | 300 s | Fix loss that starts a new file |
 | `MIN_FREE` | 32 kB | Flash reserve |

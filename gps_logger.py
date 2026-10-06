@@ -1,5 +1,5 @@
 from machine import Pin, I2C, UART
-import ssd1306, time, os, network, gc
+import ssd1306, time, os, network, gc, math
 
 # Collect garbage early and often. When an allocation doesn't fit, the ESP32
 # port grows the Python heap with the largest free IDF block (~60 kB) instead,
@@ -16,7 +16,8 @@ uart = UART(2, baudrate=BAUD, tx=17, rx=16, rxbuf=4096)   # rides out HTTP calls
 REFRESH = 500                            # ms between screen redraws
 NO_DATA = 3000                           # ms of silence = "No data!"
 
-SAMPLE = 1000                            # ms between recorded positions
+SAMPLE = 1000                            # ms between sampled positions
+MIN_MOVE = 10                            # m from the last recorded point
 FLUSH = 60000                            # ms between batch writes to flash
 NEW_FILE_GAP = 300                       # s without fix before a new file
 STALE = 2000                             # ms: older position = no fix
@@ -300,7 +301,8 @@ def log_reset():
     log.clear()
     log.update(file=None, created=False, batch=[], points=0, err=0,
                fix=False, lost_at=None, new_seg=False, full=False, online=False,
-               last_sample=None, last_flush=time.ticks_ms(), last_t=None)
+               last_sample=None, last_flush=time.ticks_ms(), last_t=None,
+               prev=None)
 
 def free():
     try:
@@ -321,7 +323,7 @@ def start_file():
         pass                             # already exists
     name = st["date"].replace("-", "") + "_" + st["time"].replace(":", "")
     log.update(file=LOG_DIR + "/" + name + ".gpx", created=False, points=0,
-               new_seg=False)
+               new_seg=False, prev=None)
     flush()                              # create it right away
 
 def flush():
@@ -361,8 +363,15 @@ def flush():
     del batch[:]
     log["new_seg"] = False
 
+def _dist(lat1, lon1, lat2, lon2):
+    """Metres between two nearby positions (equirectangular approximation)."""
+    x = math.radians(lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2))
+    y = math.radians(lat2 - lat1)
+    return 6371000 * math.sqrt(x * x + y * y)
+
 def log_tick():
-    """Sample a position every SAMPLE ms, write a batch every FLUSH ms."""
+    """Sample a position every SAMPLE ms and record it if it is more than
+    MIN_MOVE m from the last recorded point; write a batch every FLUSH ms."""
     if log["full"] or log["online"]:
         return
     now = time.ticks_ms()
@@ -380,12 +389,17 @@ def log_tick():
             start_file()
         else:
             log["new_seg"] = True
+            log["prev"] = None           # start the segment with this fix
     if (log["last_sample"] is None
             or time.ticks_diff(now, log["last_sample"]) >= SAMPLE):
         log["last_sample"] = now
         t = st["date"] + "T" + st["time"] + "Z"
-        if t != log["last_t"]:
+        prev = log["prev"]
+        if t != log["last_t"] and (
+                prev is None
+                or _dist(prev[0], prev[1], st["lat"], st["lon"]) > MIN_MOVE):
             log["last_t"] = t
+            log["prev"] = (st["lat"], st["lon"])
             ele = ("<ele>%.1f</ele>" % st["alt"]
                    if st["alt"] is not None else "")
             log["batch"].append(
@@ -405,7 +419,8 @@ def mode_tick():
     if on:                               # close the file so it gets uploaded
         flush()
         del log["batch"][:]
-        log.update(file=None, fix=False, new_seg=False, last_t=None)
+        log.update(file=None, fix=False, new_seg=False, last_t=None,
+                   prev=None)
         up["left"] = count_points()
         up["next_at"] = time.ticks_ms()
     else:                                # next fix starts a new file
