@@ -357,6 +357,7 @@ def flush():
         log["err"] += 1                  # keep the batch, retry next FLUSH
         return
     log["points"] += len(batch)
+    up["left"] += len(batch)
     del batch[:]
     log["new_seg"] = False
 
@@ -405,6 +406,7 @@ def mode_tick():
         flush()
         del log["batch"][:]
         log.update(file=None, fix=False, new_seg=False, last_t=None)
+        up["left"] = count_points()
         up["next_at"] = time.ticks_ms()
     else:                                # next fix starts a new file
         log.update(fix=False, lost_at=None)
@@ -430,13 +432,36 @@ up = {}
 def up_reset():
     up.clear()
     up.update(url=None, key=None, state="idle", sent=0, err=0, files=0,
-              next_at=time.ticks_ms())
+              left=0, next_at=time.ticks_ms())
     try:
         for n in os.listdir(LOG_DIR):
             if n.endswith(".tmp"):
                 os.remove(LOG_DIR + "/" + n)   # rewrite cut by power loss
     except OSError:
         pass
+    oled.fill(0)
+    oled.text("Counting points", 0, 28)
+    oled.show()
+    up["left"] = count_points()
+
+def count_points():
+    """Points in all GPX files, the one being recorded included. Reads every
+    file, so it runs only at boot and when going online; flush() and
+    drop_points() keep up["left"] current in between."""
+    try:
+        names = [n for n in os.listdir(LOG_DIR) if n.endswith(".gpx")]
+    except OSError:
+        return 0
+    total = 0
+    for n in names:
+        try:
+            with open(LOG_DIR + "/" + n) as f:
+                for line in f:
+                    if line.startswith("<trkpt"):
+                        total += 1
+        except OSError:
+            pass                         # unreadable: upload reports fs err
+    return total
 
 def pending():
     """Finished GPX files, oldest first (names are YYYYMMDD_HHMMSS)."""
@@ -492,7 +517,7 @@ def read_batch(path):
 
 def drop_points(path, n):
     """Remove the first n points from path; delete it if none are left."""
-    tmp, left = path + ".tmp", 0
+    tmp, left, cut = path + ".tmp", 0, n
     with open(path) as src, open(tmp, "w") as dst:
         for line in src:
             if line.startswith("<trkpt"):
@@ -508,6 +533,7 @@ def drop_points(path, n):
     else:
         os.remove(tmp)
         os.remove(path)
+    up["left"] = max(up["left"] - (cut - n), 0)
 
 def upload_tick():
     """Send one batch when online and due."""
@@ -521,6 +547,7 @@ def upload_tick():
     files = pending()
     up["files"] = len(files)
     if not files:
+        up["left"] = 0
         up["state"] = "idle"
         up["next_at"] = time.ticks_add(now, UPLOAD_RETRY)
         return
@@ -602,6 +629,10 @@ def status():
 def _fmt(fmt, v):
     return fmt % v if v is not None else "--"
 
+def _short(n):
+    """Fit a count into the 4 chars left after "Points left "."""
+    return str(n) if n < 10000 else "%dk" % (n // 1000)
+
 def draw():
     oled.fill(0)
     oled.fill_rect(0, 0, 128, 8, 1)
@@ -613,7 +644,7 @@ def draw():
             "GPS " + status(),
             "Mode " + ("UPLOAD" if log["online"] else "LOG"),
             "Flash " + _fmt("%d kB", None if room is None else room // 1024),
-            "RAM %d kB" % (gc.mem_free() // 1024))):
+            "Points left " + _short(up["left"]))):
         oled.text(line, 0, 10 + row * 11)
     oled.show()
 

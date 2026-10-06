@@ -13,7 +13,7 @@ stops logging and uploads the finished tracks to a
 - Short fix losses start a new track segment; a gap over 5 minutes starts a new file.
 - Keeps 32 kB of flash free; stops logging when full.
 - On WiFi: uploads finished files oldest-first, 50 points per POST, trimming accepted points from the file and deleting it when empty. Resends after a crash are deduplicated by Dawarich.
-- 128×64 OLED status screen: WiFi state, GPS fix (2D/3D/DGPS), mode (LOG/UPLOAD), free flash and RAM.
+- 128×64 OLED status screen: WiFi state, GPS fix (2D/3D/DGPS), mode (LOG/UPLOAD), free flash and points left to upload.
 
 ## Hardware
 
