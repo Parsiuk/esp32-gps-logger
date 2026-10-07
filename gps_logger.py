@@ -1,5 +1,5 @@
 from machine import Pin, I2C, UART
-import ssd1306, time, os, network, gc, math
+import ssd1306, time, os, network, gc, math, bluetooth
 
 # Collect garbage early and often. When an allocation doesn't fit, the ESP32
 # port grows the Python heap with the largest free IDF block (~60 kB) instead,
@@ -25,7 +25,8 @@ LOG_DIR = "/gpx"
 MIN_FREE = 32768                         # bytes of flash kept free
 MAX_BATCH = 600                          # points kept in RAM if writes fail
 
-ENV_FILE = "/.env"                       # SSID, WPA2, GEO_URL, API_KEY lines
+ENV_FILE = "/.env"                       # SSID, WPA2, GEO_URL, API_KEY,
+                                         # OBDII_ADDRESS, OBDII_PIN lines
 WIFI_CHECK = FLUSH                       # ms between checks while connected
 WIFI_RETRY = 15000                       # ms between reconnects while down
 
@@ -35,6 +36,13 @@ UPLOAD_GAP = 5000                        # ms between successful batches
 UPLOAD_RETRY = 60000                     # ms to wait after a failed batch
 HTTP_TIMEOUT = 15                        # s
 DEVICE_ID = "esp32"
+
+OBD_RETRY = 10000                        # ms between connect / 0100 attempts
+OBD_CONNECT = 5000                       # ms to look for the adapter
+OBD_TIMEOUT = 2000                       # ms to wait for a reply
+OBD_SLOW = 10000                         # ms for ATZ and 0100 (protocol search)
+OBD_STALE = 3000                         # ms: older values aren't logged
+OBD_IDLE = 60000                         # ms without a fix before BLE is off
 
 # --- NMEA parsing -----------------------------------------------------------
 
@@ -218,8 +226,7 @@ def _connect():
         wifi["state"] = "error"
     wifi["tries"] += 1
 
-def wifi_start():
-    env = load_env(ENV_FILE)
+def wifi_start(env):
     wifi["ssid"], wifi["pw"] = env.get("SSID"), env.get("WPA2")
     up["url"] = env.get("GEO_URL", "").rstrip("/") or None
     up["key"] = env.get("API_KEY") or None
@@ -403,8 +410,8 @@ def log_tick():
             ele = ("<ele>%.1f</ele>" % st["alt"]
                    if st["alt"] is not None else "")
             log["batch"].append(
-                '<trkpt lat="%.6f" lon="%.6f">%s<time>%s</time></trkpt>\n'
-                % (st["lat"], st["lon"], ele, t))
+                '<trkpt lat="%.6f" lon="%.6f">%s<time>%s</time>%s</trkpt>\n'
+                % (st["lat"], st["lon"], ele, t, obd_ext(now)))
             if len(log["batch"]) > MAX_BATCH:
                 log["batch"].pop(0)
     if time.ticks_diff(now, log["last_flush"]) >= FLUSH:
@@ -631,6 +638,302 @@ def _low_mem(now):
     up["next_at"] = time.ticks_add(now, UPLOAD_RETRY)
     print("upload MemoryError, free", gc.mem_free())
 
+# --- OBD-II -----------------------------------------------------------------
+# An ELM327-style adapter over BLE (MicroPython has no Classic Bluetooth). It
+# is used only while logging with a fix: then the adapter is connected, its
+# serial characteristic found and subscribed to, the ELM327 initialised, and
+# the Mode 01 PIDs it supports (per 0100) polled in turn, one request at a
+# time. Each recorded point gets the values that are fresh. Without a fix
+# nothing is sent; BLE is switched off after OBD_IDLE, and at once when going
+# online, as NimBLE shares the IDF heap that TLS uploads need.
+#
+# The IRQ handler walks connect -> services -> characteristics -> CCCD ->
+# subscribed, and collects the replies; obd_tick() sends the commands.
+
+_IRQ_PERIPHERAL_CONNECT = 7
+_IRQ_PERIPHERAL_DISCONNECT = 8
+_IRQ_GATTC_SERVICE_RESULT = 9
+_IRQ_GATTC_SERVICE_DONE = 10
+_IRQ_GATTC_CHARACTERISTIC_RESULT = 11
+_IRQ_GATTC_CHARACTERISTIC_DONE = 12
+_IRQ_GATTC_DESCRIPTOR_RESULT = 13
+_IRQ_GATTC_DESCRIPTOR_DONE = 14
+_IRQ_GATTC_WRITE_DONE = 17
+_IRQ_GATTC_NOTIFY = 18
+_IRQ_GATTC_INDICATE = 19
+_IRQ_ENCRYPTION_UPDATE = 28
+_IRQ_PASSKEY_ACTION = 31
+_PASSKEY_ACTION_INPUT = 2
+_IO_KEYBOARD_ONLY = 2
+_NO_CONN = 0xFFFF                        # connect attempt that timed out
+
+_WRITE_NR, _WRITE, _NOTIFY, _INDICATE = 0x04, 0x08, 0x10, 0x20
+_CCCD = bluetooth.UUID(0x2902)
+_STD = (bluetooth.UUID(0x1800), bluetooth.UUID(0x1801),   # GAP, GATT,
+        bluetooth.UUID(0x180A))                           # device info
+_KNOWN = (bluetooth.UUID(0xFFF0), bluetooth.UUID(0xFFE0),  # tried first
+          bluetooth.UUID("E7810A71-73AE-499D-8C15-FAA9AEF0C3F2"))  # Vgate
+
+OBD_INIT = ("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0", "0100")
+OBD_PIDS = (("0C", "rpm", 2, lambda d: "%d" % ((d[0] * 256 + d[1]) // 4)),
+            ("0D", "speed", 1, lambda d: "%d" % d[0]),                # km/h
+            ("11", "throttle", 1, lambda d: "%.1f" % (d[0] * 100 / 255)))
+_BUSY = ("connecting", "discover", "init", "ok", "no ECU", "no PID")
+
+ble = None
+obd = {}
+
+def obd_reset(env):
+    global ble
+    obd.clear()
+    obd.update(addr=None, addr_type=0, pin=None, ble=False, state="no .env",
+               since=time.ticks_ms(), conn=None, svcs=[], chars=[], rx=None,
+               tx=None, tx_mode=0, ind=False, cccd=None, paired=False,
+               buf=b"", cmd=None, sent_at=0, queue=[], pids=[], i=0, vals={},
+               next_at=time.ticks_ms(), idle_at=time.ticks_ms())
+    try:
+        a = bytes(int(x, 16) for x in env.get("OBDII_ADDRESS", "").split(":"))
+    except ValueError:
+        return
+    if len(a) != 6:
+        return
+    try:
+        obd["pin"] = int(env["OBDII_PIN"])
+    except (KeyError, ValueError):
+        pass
+    obd.update(addr=a, state="off")
+    ble = bluetooth.BLE()
+    ble.irq(_obd_irq)
+
+def _obd_state(s):
+    obd["state"], obd["since"] = s, time.ticks_ms()
+
+def _obd_fail(why):
+    print("obd", why)
+    _obd_state("err")
+    obd["next_at"] = time.ticks_add(time.ticks_ms(), OBD_RETRY)
+    try:
+        if obd["conn"] is None:
+            ble.gap_connect(None)        # cancel a pending connect
+        else:
+            ble.gap_disconnect(obd["conn"])
+    except OSError:
+        pass
+
+def _obd_pick():
+    """-> (notify char, write char, service end) of the adapter's serial
+    service, or None. Chars are (value handle, properties)."""
+    svcs = ([s for s in obd["svcs"] if s[2] in _KNOWN]
+            + [s for s in obd["svcs"] if s[2] not in _KNOWN + _STD])
+    for start, end, _ in svcs:
+        rx = tx = None
+        for c in obd["chars"]:
+            if not start <= c[0] <= end:
+                continue
+            if rx is None and c[1] & (_NOTIFY | _INDICATE):
+                rx = c
+            if tx is None and c[1] & (_WRITE | _WRITE_NR):
+                tx = c
+        if rx is not None and tx is not None:
+            if rx[1] & (_WRITE | _WRITE_NR):
+                tx = rx
+            return rx, tx, end
+    return None
+
+def _obd_subscribe():
+    ble.gattc_write(obd["conn"], obd["cccd"],
+                    b"\x02\x00" if obd["ind"] else b"\x01\x00", 1)
+
+def _obd_irq(event, data):
+    o = obd
+    try:
+        if event == _IRQ_PERIPHERAL_CONNECT:
+            o.update(conn=data[0], svcs=[], chars=[], cccd=None, paired=False,
+                     buf=b"", cmd=None)
+            _obd_state("discover")
+            ble.gattc_discover_services(data[0])
+        elif event == _IRQ_PERIPHERAL_DISCONNECT:
+            o.update(conn=None, cmd=None)
+            if data[0] == _NO_CONN:      # not found: try the other type
+                o["addr_type"] ^= 1
+                if o["state"] == "connecting":
+                    _obd_state("not found")
+            elif o["state"] in _BUSY:
+                _obd_state("lost")
+        elif event == _IRQ_GATTC_SERVICE_RESULT:
+            o["svcs"].append((data[1], data[2], bluetooth.UUID(data[3])))
+        elif event == _IRQ_GATTC_SERVICE_DONE:
+            ble.gattc_discover_characteristics(o["conn"], 1, 0xFFFF)
+        elif event == _IRQ_GATTC_CHARACTERISTIC_RESULT:
+            o["chars"].append((data[2], data[3]))
+        elif event == _IRQ_GATTC_CHARACTERISTIC_DONE:
+            p = _obd_pick()
+            if p is None:
+                _obd_fail("no serial characteristic")
+                _obd_state("no serial")
+                return
+            rx, tx, end = p
+            o.update(rx=rx[0], tx=tx[0], ind=not rx[1] & _NOTIFY,
+                     tx_mode=0 if tx[1] & _WRITE_NR else 1)
+            if rx[0] < end:
+                ble.gattc_discover_descriptors(o["conn"], rx[0] + 1, end)
+            else:
+                o["cccd"] = rx[0] + 1
+                _obd_subscribe()
+        elif event == _IRQ_GATTC_DESCRIPTOR_RESULT:
+            if o["cccd"] is None and bluetooth.UUID(data[2]) == _CCCD:
+                o["cccd"] = data[1]
+        elif event == _IRQ_GATTC_DESCRIPTOR_DONE:
+            if o["cccd"] is None:
+                o["cccd"] = o["rx"] + 1
+            _obd_subscribe()
+        elif event == _IRQ_GATTC_WRITE_DONE:
+            status = data[2]
+            if not status:
+                if data[1] == o["cccd"] and o["state"] == "discover":
+                    o.update(queue=list(OBD_INIT), next_at=time.ticks_ms())
+                    _obd_state("init")
+            elif (status & 0xFF) in (5, 15) and not o["paired"]:
+                o["paired"] = True       # insufficient authentication or
+                ble.gap_pair(o["conn"])  # encryption: pair, then retry
+            else:
+                _obd_fail("write status %d" % status)
+        elif event == _IRQ_ENCRYPTION_UPDATE:
+            if data[1] and o["state"] == "discover":
+                _obd_subscribe()
+        elif event in (_IRQ_GATTC_NOTIFY, _IRQ_GATTC_INDICATE):
+            if data[1] == o["rx"] and len(o["buf"]) < 256:
+                o["buf"] += bytes(data[2])
+        elif event == _IRQ_PASSKEY_ACTION:
+            if data[1] == _PASSKEY_ACTION_INPUT and o["pin"] is not None:
+                ble.gap_passkey(data[0], data[1], o["pin"])
+    except (OSError, ValueError) as e:
+        _obd_fail("irq %d %r" % (event, e))
+
+def _obd_parse(buf, pid, n):
+    """ELM327 reply -> n data bytes of its first '41<pid>' line, or None
+    (NO DATA, UNABLE TO CONNECT, ?, garbage...)."""
+    try:
+        s = buf.decode()
+    except UnicodeError:
+        return None
+    want = "41" + pid
+    for line in s.replace(" ", "").replace("\n", "\r").replace(">", "\r") \
+            .split("\r"):
+        if line.startswith(want) and len(line) >= 4 + 2 * n:
+            try:
+                return [int(line[4 + 2 * k:6 + 2 * k], 16) for k in range(n)]
+            except ValueError:
+                return None
+    return None
+
+def _obd_send(cmd, now):
+    obd.update(buf=b"", cmd=cmd, sent_at=now)
+    ble.gattc_write(obd["conn"], obd["tx"], (cmd + "\r").encode(),
+                    obd["tx_mode"])
+
+def _obd_reply(cmd, buf, now):
+    o = obd
+    if cmd == "0100":
+        d = _obd_parse(buf, "00", 4)
+        print("obd", cmd, buf)
+        if d is None:                    # ignition off or no ECU yet
+            _obd_state("no ECU")
+            o["next_at"] = time.ticks_add(now, OBD_RETRY)
+            return
+        mask = d[0] << 24 | d[1] << 16 | d[2] << 8 | d[3]
+        o.update(i=0, pids=[p for p in OBD_PIDS
+                            if mask >> (32 - int(p[0], 16)) & 1])
+        print("obd PIDs %08x" % mask, [p[1] for p in o["pids"]])
+        _obd_state("ok" if o["pids"] else "no PID")
+    elif o["state"] == "ok":
+        for pid, name, n, fmt in o["pids"]:
+            if cmd == "01" + pid:
+                d = _obd_parse(buf, pid, n)
+                if d is not None:
+                    o["vals"][name] = (fmt(d), now)
+    else:
+        print("obd", cmd, buf)
+
+def obd_tick():
+    """Connect to the adapter and poll it while logging with a fix."""
+    o = obd
+    if o["addr"] is None:
+        return
+    now = time.ticks_ms()
+    if log["online"] or log["full"] or not log["fix"]:
+        if o["ble"] and (log["online"] or log["full"] or time.ticks_diff(
+                now, o["idle_at"]) >= OBD_IDLE):
+            obd_stop()
+        return
+    o["idle_at"] = now
+    s = o["state"]
+    if s in ("connecting", "discover"):
+        if time.ticks_diff(now, o["since"]) > OBD_CONNECT + OBD_SLOW:
+            _obd_fail("timeout " + s)
+        return
+    if o["conn"] is None:
+        if time.ticks_diff(now, o["next_at"]) < 0:
+            return
+        o["next_at"] = time.ticks_add(now, OBD_RETRY)
+        try:
+            if not o["ble"]:
+                ble.active(True)
+                o["ble"] = True
+                if o["pin"] is not None:
+                    ble.config(io=_IO_KEYBOARD_ONLY, mitm=True)
+            ble.gap_connect(o["addr_type"], o["addr"], OBD_CONNECT)
+            _obd_state("connecting")
+        except (OSError, ValueError) as e:
+            _obd_fail("connect %r" % e)
+        return
+    cmd = o["cmd"]
+    if cmd is not None:
+        done = b">" in o["buf"]
+        wait = OBD_SLOW if cmd in ("ATZ", "0100") else OBD_TIMEOUT
+        if not done and time.ticks_diff(now, o["sent_at"]) < wait:
+            return
+        o["cmd"] = None
+        _obd_reply(cmd, o["buf"] if done else b"", now)
+    if time.ticks_diff(now, o["next_at"]) < 0:
+        return
+    try:
+        if o["state"] == "init" and o["queue"]:
+            _obd_send(o["queue"].pop(0), now)
+        elif o["state"] == "no ECU":
+            _obd_send("0100", now)
+        elif o["state"] == "ok":
+            o["i"] = (o["i"] + 1) % len(o["pids"])
+            _obd_send("01" + o["pids"][o["i"] - 1][0], now)
+    except OSError as e:
+        _obd_fail("send %r" % e)
+
+def obd_ext(now):
+    """GPX <extensions> with the fresh OBD values, or ""."""
+    s = ""
+    for _, name, _, _ in OBD_PIDS:
+        v = obd["vals"].get(name)
+        if v is not None and time.ticks_diff(now, v[1]) < OBD_STALE:
+            s += "<%s>%s</%s>" % (name, v[0], name)
+    return "<extensions>" + s + "</extensions>" if s else ""
+
+def obd_stop():
+    o = obd
+    if not o["ble"]:
+        return
+    o["ble"] = False
+    try:
+        if o["conn"] is not None:
+            ble.gap_disconnect(o["conn"])
+    except OSError:
+        pass
+    try:
+        ble.active(False)
+    except OSError:
+        pass
+    o.update(conn=None, cmd=None, next_at=time.ticks_ms())
+    _obd_state("off")
+
 # --- Screen -----------------------------------------------------------------
 
 def status():
@@ -641,9 +944,6 @@ def status():
     s = {2: "2D fix", 3: "3D fix"}.get(st["fixtype"], "Fix")
     return s + " DGPS" if st["quality"] == 2 else s
 
-def _fmt(fmt, v):
-    return fmt % v if v is not None else "--"
-
 def _short(n):
     """Fit a count into the 4 chars left after "Points left "."""
     return str(n) if n < 10000 else "%dk" % (n // 1000)
@@ -653,12 +953,11 @@ def draw():
     oled.fill_rect(0, 0, 128, 8, 1)
     oled.text("GPS Logger", 0, 0, 0)
     oled.text("|/-\\"[st["spin"] % 4], 120, 0, 0)
-    room = free()
     for row, line in enumerate((
             "WiFi " + wifi["state"],
             "GPS " + status(),
             "Mode " + ("UPLOAD" if log["online"] else "LOG"),
-            "Flash " + _fmt("%d kB", None if room is None else room // 1024),
+            "BLE " + obd["state"],
             "Points left " + _short(up["left"]))):
         oled.text(line, 0, 10 + row * 11)
     oled.show()
@@ -666,16 +965,20 @@ def draw():
 # --- Main loop --------------------------------------------------------------
 
 def run():
-    """Show the logger state on the OLED, log GPX offline, upload online."""
+    """Show the logger state on the OLED, log GPX (with OBD-II data)
+    offline, upload online."""
+    env = load_env(ENV_FILE)
     reset()
     log_reset()
     wifi_reset()
     up_reset()
-    wifi_start()
+    obd_reset(env)
+    wifi_start(env)
     try:
         _loop()
     finally:
         flush()                          # don't lose the pending batch
+        obd_stop()
         wifi_stop()
 
 def _loop():
@@ -685,6 +988,7 @@ def _loop():
         log_tick()
         wifi_tick()
         mode_tick()
+        obd_tick()                       # BLE off before an upload starts
         upload_tick()
         now = time.ticks_ms()
         if last is None or time.ticks_diff(now, last) >= REFRESH:
