@@ -12,8 +12,9 @@ stops logging and uploads the finished tracks to a
 - Power-loss safe: each file is always a complete GPX document, written in batches every 60 s (LittleFS commits on close).
 - Short fix losses start a new track segment; a gap over 5 minutes starts a new file.
 - Keeps 32 kB of flash free; stops logging when full.
+- Reads engine data from an ELM327 BLE OBD-II adapter while logging with a GPS fix: RPM (`0C`), vehicle speed (`0D`) and throttle position (`11`), whichever the car reports as supported via PID `00`. Each point carries the latest values in `<extensions>`. Bluetooth is off in UPLOAD mode and after a minute without a fix.
 - On WiFi: uploads finished files oldest-first, 50 points per POST, trimming accepted points from the file and deleting it when empty. Resends after a crash are deduplicated by Dawarich.
-- 128×64 OLED status screen: WiFi state, GPS fix (2D/3D/DGPS), mode (LOG/UPLOAD), free flash and points left to upload.
+- 128×64 OLED status screen: WiFi state, GPS fix (2D/3D/DGPS), mode (LOG/UPLOAD), BLE/OBD-II state and points left to upload.
 
 ## Hardware
 
@@ -22,6 +23,7 @@ stops logging and uploads the finished tracks to a
 | ESP32 dev board | Original ESP32 (Xtensa, `-march=xtensawin`) |
 | GPS module | u-blox NEO-6M / 7M / 8M, UART at 9600 baud |
 | OLED display | SSD1306, 128×64, I²C (address 0x3C) |
+| OBD-II adapter | ELM327-compatible, **Bluetooth Low Energy** (e.g. Vgate iCar Pro BLE, Veepeak BLE); Classic-only (SPP) adapters don't work with MicroPython; optional |
 | Push button | E.g. the centre (M) press of a 5-way joystick module; optional |
 
 ### Wiring
@@ -62,6 +64,8 @@ SSID=MyHomeWifi
 WPA2=wifi-password
 GEO_URL=https://dawarich.example.com
 API_KEY=your-dawarich-api-key
+OBDII_ADDRESS=AA:BB:CC:DD:EE:FF
+OBDII_PIN=1234
 ```
 
 ```bash
@@ -69,6 +73,9 @@ API_KEY=your-dawarich-api-key
 ```
 
 Without `.env` the logger still records GPX; it just never goes online.
+Without `OBDII_ADDRESS` it records GPX without OBD-II data. `OBDII_PIN` is
+only used if the adapter asks for a passkey while pairing; most BLE adapters
+don't.
 
 ## Deploy
 
@@ -94,6 +101,30 @@ HTTPS uploads fail with `ENOMEM`.
   .venv/bin/mpremote cp :/gpx/20261005_101500.gpx .
   ```
 
+## OBD-II data in GPX
+
+While logging, the logger keeps a BLE connection to the adapter. It
+initialises the ELM327 (`ATZ`, `ATE0`, `ATL0`, `ATS0`, `ATH0`, `ATSP0`), reads
+the supported PIDs with `0100`, and then polls them one at a time. Values up
+to 3 s old are added to each recorded point:
+
+```xml
+<trkpt lat="53.349800" lon="-6.260300"><ele>12.0</ele><time>2026-10-07T10:15:00Z</time><extensions><rpm>1726</rpm><speed>50</speed><throttle>14.1</throttle></extensions></trkpt>
+```
+
+| Tag | PID | Unit |
+|-----|-----|------|
+| `rpm` | `0C` | rev/min |
+| `speed` | `0D` | km/h (from the car, not GPS) |
+| `throttle` | `11` | % |
+
+A tag is left out when the car doesn't support that PID or didn't answer.
+Only position and altitude are uploaded to Dawarich; the OBD-II values stay
+in the GPX files. The OLED `BLE` row shows `connecting`, `init`, `ok`,
+`no ECU` (ignition off / no answer to `0100`, retried every 10 s), `no PID`,
+`not found`, `lost`, `err` or `off`. Debug output (`0100` reply, supported
+PIDs, errors) goes to the serial console.
+
 ## Configuration
 
 Constants at the top of `gps_logger.py`:
@@ -108,3 +139,7 @@ Constants at the top of `gps_logger.py`:
 | `UPLOAD_BATCH` | 50 | Points per POST |
 | `UPLOAD_RETRY` | 60000 ms | Back-off after a failed upload |
 | `DEVICE_ID` | `esp32` | Device ID sent to Dawarich |
+| `OBD_RETRY` | 10000 ms | Interval between adapter connect / `0100` attempts |
+| `OBD_TIMEOUT` | 2000 ms | Wait for an ELM327 reply (`OBD_SLOW`, 10 s, for `ATZ` and `0100`) |
+| `OBD_STALE` | 3000 ms | Older OBD-II values aren't logged |
+| `OBD_IDLE` | 60000 ms | Time without a fix before Bluetooth is switched off |
