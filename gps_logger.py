@@ -43,6 +43,9 @@ HOME_STOP_DELAY = 120000                 # ms below HOME_STOP_SPEED before pausi
 HOME_MOVE_CONFIRM = 30000                # ms above HOME_STOP_SPEED to resume
 HOME_MOVE_DISTANCE = 60                  # m of confirmed displacement to resume
 HOME_MOVE_MAX_WAIT = 120000              # ms before restarting a stalled move check
+HOME_STILL_RESET = 10000                 # ms of sustained speed that restarts
+HOME_STILL_RESET_DISTANCE = 15           # m  ... the stop timer (not paused)
+HOME_PENDING_MAX = 90                    # samples kept while confirming a resume
 STALE = 2000                             # ms: older position = no fix
 LOG_DIR = "/gpx"
 MIN_FREE = 32768                         # bytes of flash kept free
@@ -94,11 +97,16 @@ UP_WAIT_MAX = max(BACKOFF_MAX, AUTH_BACKOFF)  # longest upload/hold deadline
 # lies further ahead than it could ever have been scheduled counts as due.
 
 TICKS_OLD = 1 << 29                      # "very old" for a wrapped age
+TICKS_SKEW = 1000                        # ms a timestamp may be "ahead"
 
 def _age(now, t):
-    """ms since ticks t; a wrapped (negative) difference is TICKS_OLD."""
+    """ms since ticks t. A timestamp taken just after now (say read_uart()
+    ran between the two ticks_ms() calls) is age 0; a wrapped (large
+    negative) difference is TICKS_OLD."""
     d = time.ticks_diff(now, t)
-    return d if d >= 0 else TICKS_OLD
+    if d >= 0:
+        return d
+    return 0 if d > -TICKS_SKEW else TICKS_OLD
 
 def _waiting(now, at, cap):
     """True while deadline at (scheduled at most cap ms ahead) is ahead."""
@@ -946,7 +954,7 @@ def log_reset():
                fix=False, lost_at=None, new_seg=False, full=False,
                home_still_since=None, home_moving_since=None,
                home_move_origin=None, home_motion_active=False,
-               home_paused=False,
+               home_paused=False, home_pending=None,
                last_sample=None, last_flush=time.ticks_ms(), last_t=None,
                prev=None, full_check=None, file_at=None, good_size=None)
 
@@ -962,12 +970,16 @@ def has_fix(now):
             and st["pos_at"] is not None
             and _age(now, st["pos_at"]) < STALE)
 
-def start_file():
+def _stamp():
+    """YYYYMMDD_HHMMSS of the current fix (track file names)."""
+    return st["date"].replace("-", "") + "_" + st["time"].replace(":", "")
+
+def start_file(stamp=None):
     try:
         os.mkdir(LOG_DIR)
     except OSError:
         pass                             # already exists
-    name = st["date"].replace("-", "") + "_" + st["time"].replace(":", "")
+    name = stamp or _stamp()
     log.update(file=LOG_DIR + "/" + name + ".trk", created=False, points=0,
                new_seg=False, file_at=time.ticks_ms(), good_size=None)
     # First write happens when there are points (parking must not create
@@ -1071,19 +1083,56 @@ def _fresh_hdop(now):
         return None
     return hdop
 
+def _home_pending_add(now):
+    """Keep the samples of a paused track that is confirming movement, so a
+    resume starts where the car started moving, not 30 s / 60 m later."""
+    if (log["last_sample"] is not None
+            and _age(now, log["last_sample"]) < SAMPLE):
+        return
+    log["last_sample"] = now
+    pend = log["home_pending"]
+    if pend is None:
+        pend = log["home_pending"] = {"lines": [], "prev": None, "t": None,
+                                      "stamp": None}
+    s = _sample_line(now, pend["prev"], pend["t"])
+    if s is None:
+        return
+    if not pend["lines"]:
+        pend["stamp"] = _stamp()
+    pend["t"], pend["prev"] = s[0], (st["lat"], st["lon"])
+    pend["lines"].append(s[1])
+    if len(pend["lines"]) > HOME_PENDING_MAX:
+        pend["lines"].pop(0)
+
+def _home_resume(now):
+    """Leave the pause; the confirmation samples open the new track."""
+    pend = log["home_pending"]
+    log.update(home_paused=False, home_pending=None, lost_at=None)
+    if pend and pend["lines"]:
+        start_file(pend["stamp"])
+        batch = log["batch"]
+        batch.extend(pend["lines"])
+        if len(batch) > MAX_BATCH:
+            del batch[:len(batch) - MAX_BATCH]
+        log.update(fix=True, prev=pend["prev"], last_t=pend["t"],
+                   last_sample=now)
+    else:
+        log.update(fix=False, prev=None, last_t=None, last_sample=None)
+
 def _home_stop_tick(now):
     """Pause after sustained low speed; require sustained motion to resume."""
     if not at_home():
         if log["home_paused"]:
-            log.update(home_paused=False, fix=False, lost_at=None,
-                       prev=None, last_t=None, last_sample=None)
+            _home_resume(now)            # driving away: keep what was seen
         log.update(home_still_since=None, home_moving_since=None,
-                   home_move_origin=None, home_motion_active=False)
+                   home_move_origin=None, home_motion_active=False,
+                   home_pending=None)
         return False
 
     speed = st.get("speed")
     if not has_fix(now) or speed is None:
-        log.update(home_moving_since=None, home_move_origin=None)
+        log.update(home_moving_since=None, home_move_origin=None,
+                   home_pending=None)
         return True if log["home_paused"] else False
 
     if speed >= HOME_STOP_SPEED:
@@ -1096,25 +1145,31 @@ def _home_stop_tick(now):
         if log["home_moving_since"] is None:
             log["home_moving_since"] = now
             log["home_move_origin"] = (st["lat"], st["lon"])
+        if paused:
+            _home_pending_add(now)
         origin = log["home_move_origin"]
-        displaced = (origin is not None
-                     and _dist(origin[0], origin[1], st["lat"], st["lon"])
-                     >= HOME_MOVE_DISTANCE)
+        moved = (0 if origin is None
+                 else _dist(origin[0], origin[1], st["lat"], st["lon"]))
         elapsed = _age(now, log["home_moving_since"])
-        if displaced and elapsed >= HOME_MOVE_CONFIRM:
+        # A few seconds of real driving restart the stop timer, so a stop
+        # right after it does not pause on the time spent parked before.
+        # A one-sample speed spike does neither.
+        if (not paused and elapsed >= HOME_STILL_RESET
+                and moved >= HOME_STILL_RESET_DISTANCE):
+            log["home_still_since"] = None
+        if moved >= HOME_MOVE_DISTANCE and elapsed >= HOME_MOVE_CONFIRM:
             log.update(home_motion_active=True, home_still_since=None,
                        home_moving_since=None, home_move_origin=None)
             if paused:
-                log.update(home_paused=False, fix=False, lost_at=None,
-                           prev=None, last_t=None, last_sample=None)
+                _home_resume(now)
             return False
         if elapsed >= HOME_MOVE_MAX_WAIT:
-            log.update(home_moving_since=now,
+            log.update(home_moving_since=now, home_pending=None,
                        home_move_origin=(st["lat"], st["lon"]))
         return paused
 
     log.update(home_moving_since=None, home_move_origin=None,
-               home_motion_active=False)
+               home_motion_active=False, home_pending=None)
     if log["home_paused"]:
         return True
     if log["home_still_since"] is None:
@@ -1129,6 +1184,24 @@ def _home_stop_tick(now):
     log.update(file=None, created=False, file_at=None, fix=False,
                new_seg=False, last_t=None, prev=None, home_paused=True)
     return True
+
+def _sample_line(now, prev, last_t):
+    """(time, track line) for the current fix, or None: HDOP too dilute
+    (try again next SAMPLE), same second as last_t, or within MIN_MOVE of
+    prev."""
+    hdop = _fresh_hdop(now)
+    if hdop is not None and hdop > MAX_HDOP:
+        return None
+    t = st["date"] + "T" + st["time"] + "Z"
+    if t == last_t or (prev is not None and _dist(
+            prev[0], prev[1], st["lat"], st["lon"]) <= MIN_MOVE):
+        return None
+    ele = ""
+    if st["alt"] is not None and st.get("fixtype") != 2:
+        ele = "%.1f" % st["alt"]
+    hd = ("%.1f" % hdop) if hdop is not None else ""
+    tc = st["date"].replace("-", "") + "T" + st["time"].replace(":", "") + "Z"
+    return t, "%.6f,%.6f,%s,%s,%s\n" % (st["lat"], st["lon"], ele, hd, tc)
 
 def log_tick():
     """Sample a position every SAMPLE ms and record it if it is more than
@@ -1179,29 +1252,14 @@ def log_tick():
     if (log["last_sample"] is None
             or _age(now, log["last_sample"]) >= SAMPLE):
         log["last_sample"] = now
-        hdop = _fresh_hdop(now)
-        if hdop is not None and hdop > MAX_HDOP:
-            pass                         # too dilute; try again next SAMPLE
-        else:
-            t = st["date"] + "T" + st["time"] + "Z"
-            prev = log["prev"]
-            if t != log["last_t"] and (
-                    prev is None
-                    or _dist(prev[0], prev[1], st["lat"], st["lon"]) > MIN_MOVE):
-                if log["file"] is None:
-                    start_file()
-                log["last_t"] = t
-                log["prev"] = (st["lat"], st["lon"])
-                ele = ""
-                if st["alt"] is not None and st.get("fixtype") != 2:
-                    ele = "%.1f" % st["alt"]
-                hd = ("%.1f" % hdop) if hdop is not None else ""
-                tc = st["date"].replace("-", "") + "T" + st["time"].replace(
-                    ":", "") + "Z"
-                log["batch"].append("%.6f,%.6f,%s,%s,%s\n" % (
-                    st["lat"], st["lon"], ele, hd, tc))
-                if len(log["batch"]) > MAX_BATCH:
-                    log["batch"].pop(0)
+        s = _sample_line(now, log["prev"], log["last_t"])
+        if s is not None:
+            if log["file"] is None:
+                start_file()
+            log["last_t"], log["prev"] = s[0], (st["lat"], st["lon"])
+            log["batch"].append(s[1])
+            if len(log["batch"]) > MAX_BATCH:
+                log["batch"].pop(0)
     if _age(now, log["last_flush"]) >= FLUSH:
         flush()
 

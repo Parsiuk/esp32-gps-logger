@@ -3137,6 +3137,100 @@ try:
     gl.handle(nmea("GPGGA,120002.00,,,,,0,00,99.9,,M,,M,,"))
     check("REVIEW-4: GGA quality 0 clears validity",
           gl.st["valid"] is False and gl.st["pos_at"] == fix_at)
+
+    # REVIEW2-1: stop timer restarted by real driving; resume keeps the
+    # samples seen while movement was being confirmed
+    def rv_home():
+        gl.reset()
+        gl.log_reset()
+        gl.wifi_reset()
+        gl.up_reset()
+        gl.wifi.update(state="connected", home=True)
+        for n in os.listdir(rv_dir):
+            os.remove(os.path.join(rv_dir, n))
+
+    rv_home()
+    lat = rv_drive(100, 47.5, speed=0.0)
+    lat = rv_drive(25, lat)
+    lat = rv_drive(1, lat, speed=0.0)
+    check("REVIEW2-1: 25 s of driving restarts the stop timer (no false pause)",
+          gl.log["home_paused"] is False and gl.log["file"] is not None,
+          "paused=%s file=%s" % (gl.log["home_paused"], gl.log["file"]))
+    lat = rv_drive(gl.HOME_STOP_DELAY // 1000, lat, speed=0.0)
+    check("REVIEW2-1: a full HOME_STOP_DELAY after that stop still pauses",
+          gl.log["home_paused"] is True)
+
+    rv_home()
+    lat = rv_drive(60, 47.5, speed=0.0)
+    still = gl.log["home_still_since"]
+    lat = rv_drive(15, lat, speed=8.0, step=0.0)    # speed noise, no movement
+    lat = rv_drive(1, lat, speed=0.0)
+    check("REVIEW2-1: sustained speed without displacement keeps the timer",
+          gl.log["home_still_since"] == still and still is not None)
+
+    rv_home()
+    lat = rv_drive(gl.HOME_STOP_DELAY // 1000 + 1, 47.5, speed=0.0)
+    check("REVIEW2-1: setup - track paused at home",
+          gl.log["home_paused"] is True and gl.log["file"] is None)
+    paused_pts = rv_points()
+    first_t = rv_sec[0]
+    lat = rv_drive(10, lat)
+    lat = rv_drive(1, lat, speed=0.0)
+    check("REVIEW2-1: short movement while paused records nothing",
+          gl.log["home_paused"] is True and rv_points() == paused_pts
+          and gl.log["home_pending"] is None and gl.log["file"] is None)
+    first_t = rv_sec[0]
+    first_lat = lat + 5.5e-5
+    lat = rv_drive(35, lat)
+    first_line = gl.log["batch"][0] if gl.log["batch"] else ""
+    check("REVIEW2-1: resume keeps the confirmation samples (whole drive)",
+          gl.log["home_paused"] is False
+          and rv_points() - paused_pts >= 34,
+          "new=%s" % (rv_points() - paused_pts))
+    check("REVIEW2-1: resumed track starts where the car started moving",
+          first_line.startswith("%.6f," % first_lat)
+          and gl.log["file"].endswith("_%02d%02d%02d.trk" % (
+              12 + first_t // 3600, (first_t // 60) % 60, first_t % 60)),
+          "line=%r file=%s" % (first_line, gl.log["file"]))
+    n_before = rv_points()
+    lat = rv_drive(5, lat)
+    check("REVIEW2-1: recording continues normally after the resume",
+          rv_points() - n_before == 5)
+
+    rv_home()
+    lat = rv_drive(gl.HOME_STOP_DELAY // 1000 + 1, 47.5, speed=0.0)
+    lat = rv_drive(10, lat)
+    gl.wifi.update(state="offline", home=False)    # drove out of WiFi range
+    _clock[0] += gl.SAMPLE
+    rv_fix(lat + 5.5e-5, 20.0)
+    gl.log_tick()
+    check("REVIEW2-1: leaving home WiFi mid-confirmation keeps those samples",
+          gl.log["home_paused"] is False and len(gl.log["batch"]) >= 10
+          and gl.log["file"] is not None,
+          "batch=%s" % len(gl.log["batch"]))
+
+    rv_home()
+    gl.wifi.update(state="connected", home=True)
+    lat = rv_drive(gl.HOME_STOP_DELAY // 1000 + 1, 47.5, speed=0.0)
+    for i in range(gl.HOME_PENDING_MAX + 20):       # 8 m zig-zag, no 60 m
+        _clock[0] += gl.SAMPLE
+        rv_fix(lat + (7e-5 if i % 2 else 0.0), 10.0)
+        gl.log_tick()
+    pend = gl.log["home_pending"]
+    check("REVIEW2-1: pending samples are capped at HOME_PENDING_MAX",
+          gl.log["home_paused"] is True and pend is not None
+          and len(pend["lines"]) == gl.HOME_PENDING_MAX,
+          "pending=%s" % (None if pend is None else len(pend["lines"])))
+
+    # REVIEW2-2: a timestamp taken just after now is age 0, not "very old"
+    now = _clock[0]
+    check("REVIEW2-2: small negative difference is age 0",
+          gl._age(now, now + 500) == 0
+          and gl._age(now, now + gl.TICKS_SKEW + 1) == gl.TICKS_OLD)
+    gl.st.update(valid=True, date="2026-10-17", time="12:00:00",
+                 lat=47.5, lon=19.0, pos_at=now + 200)
+    check("REVIEW2-2: a fix stamped just after now is still a fix",
+          bool(gl.has_fix(now)))
 finally:
     shutil.rmtree(rv_dir, ignore_errors=True)
 
