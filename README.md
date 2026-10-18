@@ -14,8 +14,9 @@ uploads already-finished files in the background.
 - Reads NMEA (`RMC`, `GGA`, `GSA`, `GSV`) from a u-blox NEO-6M/7M/8M over UART, with checksum validation.
 - Samples the position every second and records a point only after moving more than 3 m from the last recorded one (`MIN_MOVE`), to track files named `/gpx/YYYYMMDD_HHMMSS.trk`. A point is ~46 bytes (the old GPX XML was ~112), so a full flash holds about 2.4× more track; the pull script turns them back into GPX. Samples with a fresh HDOP worse than 5 are skipped; 2D fixes omit altitude.
 - Power-loss safe: each file is always complete (header, points, footer), written in batches every 60 s (LittleFS commits on close). A line cut off by a power loss is skipped.
-- Short fix losses start a new track segment; a gap over 5 minutes starts a new file. On any WiFi network, a file that has been open for 5 minutes is closed so it can upload while logging continues (offline driving stays one file; parking does not open empty files).
-- On the preferred home WiFi, track recording pauses after 2 minutes below 5 km/h to avoid logging while parked. GPS speed spikes do not reset the stop timer. While paused, recording resumes in a new track only after speed stays above 5 km/h for 30 seconds and the GPS position moves at least 60 m; the samples seen during that check are kept (up to 90), so the new track starts where the car started moving. Driving out of home WiFi range during the check resumes the same way. Before a pause nothing is gated: driving near home (arrival, a slow-down at the corner) is recorded at once, and 10 seconds above 5 km/h with at least 15 m of movement restart the stop timer, so a stop right after a short drive does not pause on the time parked before it. Stop-and-go is tolerated: dips below 5 km/h (or a lost fix) shorter than 10 seconds neither break a movement check nor advance the stop timer; a longer stop counts from the last sample above 5 km/h. Once moving is confirmed, recording continues normally until the stop timer expires again. This requires a valid GPS fix and speed reading.
+- Stationary filter, on any network. Indoors the GPS wanders tens of metres with a good HDOP and reports 5–20 km/h while lying still (measured on the board: speed p50 5.4 km/h, max 22 km/h; drift p90 46 m, one-minute centroids up to 72 m apart, excursions to 80 m), so `MIN_MOVE` alone records every step of the drift and speed cannot tell a stay from a drive. A stay is therefore position-based: two consecutive one-minute centroids within 50 m. On entry the anchor is their mean (refined while staying), and the stay's drift still in RAM is dropped, so at most the two minutes that prove the stay reach flash. Away from home the anchor is written at once and every 5 minutes (without elevation), so Dawarich still sees the stay, and nothing else. A stay ends on 3 consecutive samples more than 150 m from the anchor (beyond the drift) that keep receding (none falling back more than 5 m); the way out is then written from near the anchor, from the last 90 samples. An excursion that turns back does not end it. A walk (1.4 m/s) is never a stay: its centroid moves on by more than 50 m a minute; a very slow stroll can be one.
+- Short fix losses start a new track segment; a gap over 5 minutes starts a new file. On any WiFi network, a file that has been open for 5 minutes is closed so it can upload while logging continues (not during a stay, so anchor points do not open a file each) (offline driving stays one file; parking does not open empty files).
+- On the home network a stay closes the track instead (it uploads) and writes no anchor points; leaving opens a new track named after its first point. Arriving and driving through are recorded normally. If the home WiFi drops during a stay, anchor points start (it is still a stay).
 - Keeps 32 kB of flash free; stops logging when full. Logging resumes if space is freed (checked every few seconds).
 - Up to three WiFi networks. Network **#1 is home** by default and is preferred for connections and faster upload pacing; **#2 and #3** are additional networks (for example a phone hotspot). Logging and uploading work on all configured networks. Override home-network preference with `HOME1=0` / `HOME2=1` / `SSID2_HOME=1`. After a scan, a home AP at ≥ −75 dBm is tried first, then other visible known APs strongest-RSSI first (one SSID, strongest BSSID). Remaining configured networks are then tried in config order, so an SSID missed by the scan does not prevent fallback. A **hidden home** is tried first when the scan shows a strong empty-SSID AP (≥ −75 dBm) — that is how a hidden AP appears. If the scan itself fails, config order is used, under backoff. Connect is polled from the main loop so GPS sampling is not blocked. On a non-home net, when nearly stopped, the logger scans for home every ~5 min (backoff to 60 min only after a **visible** home switch fails; a failed hidden-home attempt stays at 5 min). A stop after driving resets that interval only if a visible home is in view, not an unverified empty-SSID AP. A visible home at ≥ −75 dBm, or a hidden home plus a strong empty-SSID AP, is tried between upload batches; hidden roam uses `bssid=None` (firmware matches by SSID) and never pins to the strongest blank AP. **Limitation:** with a hidden home SSID, switching home can be slower (no BSSID pin; arrival after driving does not try an unverified blank AP) and a neighbouring hidden AP can trigger a false attempt. Falls back to another configured network if that connect fails.
 - Uploads finished files oldest-first, 50 points per POST. Progress is a `<file>.pos` sidecar. Offset advances only after HTTP 2xx or a durable write to `<file>.bad`. Older `.gpx` files from earlier firmware are still uploaded. If `.bad` is full (64 kB), that file's uploads pause (`BAD FULL` on the OLED) instead of dropping points. Three consecutive 400/422 responses without a success are treated as a server/config problem: backoff, no more quarantine. A `.bad` retry that still 4xxs is left on flash.
@@ -164,7 +165,8 @@ falls back to DHCP rather than becoming unreachable.
 6. If every attempt fails, stay in LOG mode and retry later with capped
    exponential backoff (up to 10 minutes).
 7. While connected to a **non-home** net and nearly stopped (fresh fix
-   and speed ≥ 5 km/h is skipped; a stale speed does not block), rescan
+   and speed ≥ 5 km/h is skipped unless the logger is in a stay, since indoor
+   speed is noise; a stale speed does not block), rescan
    for home every ~5 min. Back off (10, 20, … 60 min) only after a
    **failed switch** to a *visible* home. Unseen home and a failed
    hidden-home attempt keep the 5 min interval. A stop after driving
@@ -286,15 +288,13 @@ Constants at the top of `gps_logger.py`:
 | `MIN_MOVE` | 3 m | Distance from the last recorded point before a new one is recorded |
 | `FLUSH` | 60000 ms | Interval between flash writes |
 | `NEW_FILE_GAP` | 300 s | Fix loss that starts a new file; also max age of an open file on WiFi |
-| `HOME_STOP_DELAY` | 120 s | Time below `HOME_STOP_SPEED` before pausing track recording on home WiFi |
-| `HOME_STOP_SPEED` | 5 km/h | Speed threshold for stopping/resuming track recording on home WiFi |
-| `HOME_MOVE_CONFIRM` | 30 s | Continuous time above `HOME_STOP_SPEED` required to confirm movement |
-| `HOME_MOVE_DISTANCE` | 60 m | GPS displacement required with sustained speed before paused home recording resumes |
-| `HOME_MOVE_MAX_WAIT` | 120 s | Maximum age of a home movement check before its GPS origin is refreshed |
-| `HOME_STILL_RESET` | 10 s | Sustained time above `HOME_STOP_SPEED` that restarts the stop timer (not paused) |
-| `HOME_STILL_RESET_DISTANCE` | 15 m | Displacement required with `HOME_STILL_RESET` |
-| `HOME_PENDING_MAX` | 90 | Samples kept in RAM while a paused track confirms movement |
-| `HOME_DIP_MAX` | 10 s | Dip below `HOME_STOP_SPEED` (or fix loss) a movement check survives |
+| `STILL_WINDOW` / `STILL_MIN_FIXES` | 60 s / 10 | Centroid window, and the usable fixes it needs |
+| `STILL_RADIUS` | 50 m | Max distance between two consecutive centroids for a stay |
+| `STILL_NEAR` | 50 m | Fixes this close to the anchor refine it |
+| `STILL_EXIT` / `STILL_EXIT_N` / `STILL_TOL` | 150 m / 3 / 5 m | Leaving: samples beyond this, how many in a row, how far one may fall back |
+| `STILL_HEARTBEAT` | 5 min | Anchor point interval during a stay (not on the home network) |
+| `STILL_DEP_MAX` | 90 | Recent samples kept to write the way out |
+| `STILL_MEAN_N` | 1800 | Fixes the anchor mean averages over |
 | `ROAM_CHECK` | 5 min | Home-roam scan interval on a hotspot (and after arriving) |
 | `ROAM_BACKOFF_MAX` | 60 min | Cap on roam retry after a failed home switch |
 | `ROAM_MIN_RSSI` | −75 dBm | Minimum home RSSI to switch away from a hotspot (also boot preference) |

@@ -38,16 +38,22 @@ SAMPLE = 1000                            # ms between sampled positions
 MIN_MOVE = 3                             # m from the last recorded point
 FLUSH = 60000                            # ms between batch writes to flash
 NEW_FILE_GAP = 300                       # s without fix → new file; also WiFi max age
-HOME_STOP_SPEED = 5                      # km/h below which home stop timer runs
-HOME_STOP_DELAY = 120000                 # ms below HOME_STOP_SPEED before pausing
-HOME_MOVE_CONFIRM = 30000                # ms above HOME_STOP_SPEED to resume
-HOME_MOVE_DISTANCE = 60                  # m of confirmed displacement to resume
-HOME_MOVE_MAX_WAIT = 120000              # ms before restarting a stalled move check
-HOME_STILL_RESET = 10000                 # ms of sustained speed that restarts
-HOME_STILL_RESET_DISTANCE = 15           # m  ... the stop timer (not paused)
-HOME_PENDING_MAX = 90                    # samples kept while confirming a resume
-HOME_DIP_MAX = 10000                     # ms below speed / without fix that a
-                                         # movement check survives (stop-and-go)
+# Stationary filter, on any network. Indoors the GPS wanders tens of metres
+# and reports 5-20 km/h while lying still (measured on the board: speed p50
+# 5.4 km/h, drift p90 46 m, minute centroids up to 72 m apart, excursions to
+# 80 m), so speed is not used: a stay is two consecutive STILL_WINDOW
+# centroids within STILL_RADIUS, and it ends only on samples that keep
+# receding beyond STILL_EXIT, well past the drift.
+STILL_WINDOW = 60000                     # ms per centroid window
+STILL_MIN_FIXES = 10                     # usable fixes a window needs
+STILL_RADIUS = 50                        # m between consecutive centroids
+STILL_NEAR = 50                          # m: fixes this close refine the anchor
+STILL_EXIT = 150                         # m from the anchor to start leaving
+STILL_EXIT_N = 3                         # receding samples needed to leave
+STILL_TOL = 5                            # m a receding sample may fall back
+STILL_HEARTBEAT = 300000                 # ms between anchor points (not home)
+STILL_DEP_MAX = 90                       # recent samples kept for the departure
+STILL_MEAN_N = 1800                      # samples the anchor mean averages over
 STALE = 2000                             # ms: older position = no fix
 LOG_DIR = "/gpx"
 MIN_FREE = 32768                         # bytes of flash kept free
@@ -895,7 +901,8 @@ def wifi_tick():
             if (not wifi.get("home")
                     and any(n.get("home") for n in wifi.get("nets") or [])):
                 spd = st.get("speed")
-                moving = has_fix(now) and spd is not None and spd >= 5
+                moving = (has_fix(now) and spd is not None and spd >= 5
+                          and not (log.get("still") or {}).get("active"))
                 if moving:
                     wifi["moved_at"] = now
                     arrival = False
@@ -977,11 +984,24 @@ def log_reset():
     log.clear()
     log.update(file=None, created=False, batch=[], points=0, err=0,
                fix=False, lost_at=None, new_seg=False, full=False,
-               home_still_since=None, home_moving_since=None,
-               home_move_origin=None, home_motion_active=False,
-               home_paused=False, home_pending=None, home_fast_at=None,
+               still=_still_state(),
                last_sample=None, last_flush=time.ticks_ms(), last_t=None,
                prev=None, full_check=None, file_at=None, good_size=None)
+
+def _still_state():
+    return {"active": False, "home": False, "win_at": None, "win_tc": None,
+            "ref": None, "sum": [0.0, 0.0, 0], "prev": None, "anchor": None,
+            "aref": None, "aoff": (0.0, 0.0), "n": 0, "hb_at": None,
+            "ring": [], "far_n": 0, "far_d": 0}
+
+def _still_mean(sl, pos):
+    """Fold pos into the anchor, a running mean over STILL_MEAN_N fixes.
+    Kept as an offset from a fixed reference: in single precision a
+    latitude plus a centimetre-sized step is the same latitude."""
+    r, o = sl["aref"], sl["aoff"]
+    n = min(sl["n"] + 1, STILL_MEAN_N)
+    o = (o[0] + (pos[0] - r[0] - o[0]) / n, o[1] + (pos[1] - r[1] - o[1]) / n)
+    sl.update(aoff=o, n=n, anchor=(r[0] + o[0], r[1] + o[1]))
 
 def free():
     try:
@@ -1108,150 +1128,163 @@ def _fresh_hdop(now):
         return None
     return hdop
 
-def _home_pending_add(now):
-    """Keep the samples of a paused track that is confirming movement, so a
-    resume starts where the car started moving, not 30 s / 60 m later."""
-    if (log["last_sample"] is not None
-            and _age(now, log["last_sample"]) < SAMPLE):
-        return
-    log["last_sample"] = now
-    pend = log["home_pending"]
-    if pend is None:
-        pend = log["home_pending"] = {"lines": [], "prev": None, "t": None,
-                                      "stamp": None}
-    s = _sample_line(now, pend["prev"], pend["t"])
-    if s is None:
-        return
-    if not pend["lines"]:
-        pend["stamp"] = _stamp()
-    pend["t"], pend["prev"] = s[0], (st["lat"], st["lon"])
-    pend["lines"].append(s[1])
-    if len(pend["lines"]) > HOME_PENDING_MAX:
-        pend["lines"].pop(0)
-
-def _home_resume(now):
-    """Leave the pause; the confirmation samples open the new track."""
-    pend = log["home_pending"]
-    log.update(home_paused=False, home_pending=None, lost_at=None)
-    if pend and pend["lines"]:
-        start_file(pend["stamp"])
-        batch = log["batch"]
-        batch.extend(pend["lines"])
-        if len(batch) > MAX_BATCH:
-            del batch[:len(batch) - MAX_BATCH]
-        log.update(fix=True, prev=pend["prev"], last_t=pend["t"],
-                   last_sample=now)
-    else:
-        log.update(fix=False, prev=None, last_t=None, last_sample=None)
-
-def _home_stop_tick(now):
-    """Pause after sustained low speed; require sustained motion to resume."""
-    if not at_home():
-        if log["home_paused"]:
-            _home_resume(now)            # driving away: keep what was seen
-        log.update(home_still_since=None, home_moving_since=None,
-                   home_move_origin=None, home_motion_active=False,
-                   home_pending=None, home_fast_at=None)
-        return False
-
-    speed = st.get("speed")
-    fix = has_fix(now) and speed is not None
-    if fix and speed >= HOME_STOP_SPEED:
-        log["home_fast_at"] = now
-        if log["home_motion_active"]:
-            return False
-        # Confirm real movement before the stop timer is cleared. Only a
-        # paused track waits for it; an active one keeps recording, so the
-        # arrival and every slow-down near home are not lost.
-        paused = log["home_paused"]
-        if log["home_moving_since"] is None:
-            log["home_moving_since"] = now
-            log["home_move_origin"] = (st["lat"], st["lon"])
-        if paused:
-            _home_pending_add(now)
-        origin = log["home_move_origin"]
-        moved = (0 if origin is None
-                 else _dist(origin[0], origin[1], st["lat"], st["lon"]))
-        elapsed = _age(now, log["home_moving_since"])
-        # A few seconds of real driving restart the stop timer, so a stop
-        # right after it does not pause on the time spent parked before.
-        # A one-sample speed spike does neither.
-        if (not paused and elapsed >= HOME_STILL_RESET
-                and moved >= HOME_STILL_RESET_DISTANCE):
-            log["home_still_since"] = None
-        if moved >= HOME_MOVE_DISTANCE and elapsed >= HOME_MOVE_CONFIRM:
-            log.update(home_motion_active=True, home_still_since=None,
-                       home_moving_since=None, home_move_origin=None)
-            if paused:
-                _home_resume(now)
-            return False
-        if elapsed >= HOME_MOVE_MAX_WAIT:
-            log.update(home_moving_since=now, home_pending=None,
-                       home_move_origin=(st["lat"], st["lon"]))
-        return paused
-
-    # Below the speed threshold, or no usable fix. A short dip (stop-and-go
-    # traffic, a gate, one lost epoch) does not break a running movement
-    # check: it keeps its start, origin and buffered samples. Only a longer
-    # one ends it, and then the stop counts from the last fast sample.
-    if log["home_moving_since"] is not None:
-        fast_at = log["home_fast_at"]
-        if fast_at is not None and _age(now, fast_at) < HOME_DIP_MAX:
-            if log["home_paused"]:
-                if fix:
-                    _home_pending_add(now)
-                return True
-            return False
-        if log["home_still_since"] is None and fast_at is not None:
-            log["home_still_since"] = fast_at
-    log.update(home_moving_since=None, home_move_origin=None,
-               home_pending=None, home_fast_at=None)
-    if not fix:
-        return True if log["home_paused"] else False
-    log["home_motion_active"] = False
-    if log["home_paused"]:
-        return True
-    if log["home_still_since"] is None:
-        log["home_still_since"] = now
-    if _age(now, log["home_still_since"]) < HOME_STOP_DELAY:
-        return False
-
-    if log["batch"]:
-        flush()
-    if log["batch"]:
-        return True
-    log.update(file=None, created=False, file_at=None, fix=False,
-               new_seg=False, last_t=None, prev=None, home_paused=True)
-    return True
-
-def _sample_line(now, prev, last_t):
+def _sample_line(now, prev, last_t, at=None):
     """(time, track line) for the current fix, or None: HDOP too dilute
     (try again next SAMPLE), same second as last_t, or within MIN_MOVE of
-    prev."""
+    prev. at=(lat, lon) writes that position instead (a stationary anchor,
+    a mean) and leaves the elevation out."""
     hdop = _fresh_hdop(now)
     if hdop is not None and hdop > MAX_HDOP:
         return None
+    lat, lon = at if at is not None else (st["lat"], st["lon"])
     t = st["date"] + "T" + st["time"] + "Z"
     if t == last_t or (prev is not None and _dist(
-            prev[0], prev[1], st["lat"], st["lon"]) <= MIN_MOVE):
+            prev[0], prev[1], lat, lon) <= MIN_MOVE):
         return None
     ele = ""
-    if st["alt"] is not None and st.get("fixtype") != 2:
+    if at is None and st["alt"] is not None and st.get("fixtype") != 2:
         ele = "%.1f" % st["alt"]
     hd = ("%.1f" % hdop) if hdop is not None else ""
     tc = st["date"].replace("-", "") + "T" + st["time"].replace(":", "") + "Z"
-    return t, "%.6f,%.6f,%s,%s,%s\n" % (st["lat"], st["lon"], ele, hd, tc)
+    return t, "%.6f,%.6f,%s,%s,%s\n" % (lat, lon, ele, hd, tc)
+
+def _record(s, pos):
+    """Append a (time, line) from _sample_line; pos is what it wrote."""
+    if log["file"] is None:
+        start_file()
+    log["last_t"], log["prev"] = s[0], pos
+    log["batch"].append(s[1])
+    if len(log["batch"]) > MAX_BATCH:
+        log["batch"].pop(0)
+
+def _tc():
+    """Compact UTC time of the current fix, as in a track line."""
+    return st["date"].replace("-", "") + "T" + st["time"].replace(":", "") + "Z"
+
+def _still_window(now, pos):
+    """Fold a usable fix into the current centroid window. When the window
+    is full and its centroid lies within STILL_RADIUS of the previous one,
+    return (anchor, stay start time, fixes); a walk moves the centroid on.
+    Sums are offsets from the window's first fix: single-precision floats
+    cannot add up 60 latitudes to the metre."""
+    sl = log["still"]
+    if sl["win_at"] is None:
+        sl.update(win_at=now, win_tc=_tc(), ref=pos, sum=[0.0, 0.0, 0])
+    r, sm = sl["ref"], sl["sum"]
+    sm[0] += pos[0] - r[0]
+    sm[1] += pos[1] - r[1]
+    sm[2] += 1
+    if _age(now, sl["win_at"]) < STILL_WINDOW:
+        return None
+    c = None
+    if sm[2] >= STILL_MIN_FIXES:
+        c = (r[0] + sm[0] / sm[2], r[1] + sm[1] / sm[2])
+    prev = sl["prev"]
+    sl["prev"] = (c, sl["win_tc"], sm[2]) if c else None
+    sl["win_at"] = None
+    if c is None or prev is None:
+        return None
+    if _dist(prev[0][0], prev[0][1], c[0], c[1]) > STILL_RADIUS:
+        return None
+    w = prev[2] + sm[2]
+    a = (prev[0][0] + (c[0] - prev[0][0]) * sm[2] / w,
+         prev[0][1] + (c[1] - prev[0][1]) * sm[2] / w)
+    return a, prev[1], w
+
+def _still_heartbeat(now):
+    """Write the anchor as a point (retried next SAMPLE if the fix is too
+    dilute or this second was already written)."""
+    sl = log["still"]
+    s = _sample_line(now, None, log["last_t"], at=sl["anchor"])
+    if s is not None:
+        sl["hb_at"] = now
+        _record(s, sl["anchor"])
+
+def _still_close():
+    """Home stay: finish the track so it uploads (retried while a flush
+    fails); nothing more is written until the stay ends."""
+    if log["file"] is None:
+        return
+    if log["batch"]:
+        flush()
+    if not log["batch"]:
+        log.update(file=None, created=False, file_at=None, new_seg=False)
+
+def _still_enter(now, anchor, since_tc, n):
+    """Become stationary at anchor. The stay's drift still in RAM (lines
+    from since_tc on) is dropped. On the home network the track is closed,
+    elsewhere the anchor is written now and then every STILL_HEARTBEAT."""
+    log["still"] = sl = _still_state()
+    sl.update(active=True, anchor=anchor, aref=anchor,
+              n=min(n, STILL_MEAN_N))
+    b = log["batch"]
+    b[:] = [l for l in b if l.rstrip()[-16:] < since_tc]
+    if at_home():
+        sl["home"] = True
+        _still_close()
+    else:
+        _still_heartbeat(now)
+
+def _still_leave():
+    """End the stay and write the way out: the trailing run of recent
+    samples whose distance from the anchor kept growing (within STILL_TOL),
+    so the departure starts near the anchor, not STILL_EXIT away."""
+    ring = log["still"]["ring"]
+    i = len(ring) - 1
+    while i > 0 and ring[i - 1][2] <= ring[i][2] + STILL_TOL:
+        i -= 1
+    prev = None
+    for s, p, d in ring[i:]:
+        if s is None or s[0] == log["last_t"] or (
+                prev is not None
+                and _dist(prev[0], prev[1], p[0], p[1]) <= MIN_MOVE):
+            continue
+        if log["file"] is None:
+            tc = s[1].rstrip()[-16:]
+            start_file(tc[:8] + "_" + tc[9:15])
+        _record(s, p)
+        prev = p
+    log["still"] = _still_state()
+
+def _still_active(now, pos):
+    """One usable fix while stationary: watch for a departure (STILL_EXIT_N
+    consecutive samples beyond STILL_EXIT that keep receding; an excursion
+    that turns back does not count), refine the anchor, keep the track
+    closed on the home network and the heartbeat going elsewhere."""
+    sl = log["still"]
+    a = sl["anchor"]
+    d = _dist(a[0], a[1], pos[0], pos[1])
+    ring = sl["ring"]
+    ring.append((_sample_line(now, None, None), pos, d))
+    if len(ring) > STILL_DEP_MAX:
+        ring.pop(0)
+    if d > STILL_EXIT and d + STILL_TOL >= sl["far_d"]:
+        sl["far_n"] += 1
+        sl["far_d"] = d
+        if sl["far_n"] >= STILL_EXIT_N:
+            _still_leave()
+            return
+    else:
+        sl["far_n"], sl["far_d"] = 0, 0
+        if d <= STILL_NEAR:
+            _still_mean(sl, pos)
+    home = bool(at_home())
+    if home != sl["home"]:
+        sl["home"] = home
+        sl["hb_at"] = None
+    if home:
+        _still_close()
+    elif sl["hb_at"] is None or _age(now, sl["hb_at"]) >= STILL_HEARTBEAT:
+        _still_heartbeat(now)
 
 def log_tick():
     """Sample a position every SAMPLE ms and record it if it is more than
     MIN_MOVE m from the last recorded point; write a batch every FLUSH ms."""
     now = time.ticks_ms()
-    if _home_stop_tick(now):
-        return
     # Close a long-open file on any WiFi network so it can upload while
     # logging continues. Offline driving keeps one file.
     if (log["file"] is not None and log.get("file_at") is not None
-            and wifi["state"] == "connected"
+            and wifi["state"] == "connected" and not log["still"]["active"]
             and log["points"] + len(log["batch"]) > 0
             and _age(now, log["file_at"]) >= NEW_FILE_GAP * 1000
             and _age(now, log["last_flush"]) >= FLUSH):
@@ -1291,14 +1324,18 @@ def log_tick():
     if (log["last_sample"] is None
             or _age(now, log["last_sample"]) >= SAMPLE):
         log["last_sample"] = now
-        s = _sample_line(now, log["prev"], log["last_t"])
-        if s is not None:
-            if log["file"] is None:
-                start_file()
-            log["last_t"], log["prev"] = s[0], (st["lat"], st["lon"])
-            log["batch"].append(s[1])
-            if len(log["batch"]) > MAX_BATCH:
-                log["batch"].pop(0)
+        hdop = _fresh_hdop(now)
+        if hdop is None or hdop <= MAX_HDOP:
+            pos = (st["lat"], st["lon"])
+            if log["still"]["active"]:
+                _still_active(now, pos)
+            else:
+                s = _sample_line(now, log["prev"], log["last_t"])
+                if s is not None:
+                    _record(s, pos)
+                hit = _still_window(now, pos)
+                if hit:
+                    _still_enter(now, hit[0], hit[1], hit[2])
     if _age(now, log["last_flush"]) >= FLUSH:
         flush()
 

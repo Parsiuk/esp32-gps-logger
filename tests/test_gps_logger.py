@@ -1455,72 +1455,54 @@ try:
     check("B3: OLED mode LOG+UP on home",
           gl._mode_line() == "Mode LOG+UP")
 
-    still_since = gl.log["home_still_since"]
-    _clock[0] += 10000
-    gps_fix(52.5101, speed=6.0)
-    gl.log_tick()
-    check("HOME STOP: brief GPS speed spike does not reset stopped timer",
-          gl.log["home_still_since"] == still_since
-          and gl.log["home_paused"] is False)
-    _clock[0] += gl.HOME_STOP_DELAY - 10001
-    gps_fix(52.5101, speed=0.0)
-    gl.log_tick()
-    check("HOME STOP: low speed must persist for the full delay",
-          gl.log["home_paused"] is False)
-    _clock[0] += 1
-    gl.st.update(speed=None, pos_at=_clock[0] - gl.STALE - 1)
-    gl.log_tick()
-    check("HOME STOP: temporary GPS fix loss does not restart stopped timer",
-          gl.log["home_still_since"] == still_since
-          and gl.log["home_paused"] is False)
-    _clock[0] += 100
-    gps_fix(52.5101, speed=0.0)
-    gl.log_tick()
-    check("HOME STOP: pause and close the track after 2 minutes stopped",
-          gl.log["home_paused"] is True and gl.log["file"] is None
-          and gl.log["batch"] == [] and home_path in gl.pending())
+    # HOME STAY: two calm minutes on the home network close the track,
+    # whatever the (noisy) GPS speed says; a departure opens a new one
+    import random
+    hs_rnd = random.Random(7)
+    hs_t = [0]
 
-    _clock[0] += gl.SAMPLE
-    gps_fix(52.511, speed=6.0)
-    gl.st["time"] = "12:03:00"
-    gl.log_tick()
-    check("HOME STOP: brief movement does not resume recording",
-          gl.log["home_paused"] is True)
-    _clock[0] += gl.HOME_MOVE_CONFIRM
-    gps_fix(52.511, speed=6.0)
-    gl.st["time"] = "12:03:30"
-    gl.log_tick()
-    check("HOME STOP: speed alone without 60 m displacement stays paused",
-          gl.log["home_paused"] is True and gl.log["file"] is None)
-    _clock[0] += 1
-    gps_fix(52.512, speed=6.0)
-    gl.st["time"] = "12:03:31"
-    gl.log_tick()
+    def hs_fix(lat, speed):
+        _clock[0] += gl.SAMPLE
+        hs_t[0] += 1
+        gps_fix(lat, speed=speed)
+        gl.st["time"] = "%02d:%02d:%02d" % (12 + hs_t[0] // 3600,
+                                            (hs_t[0] // 60) % 60, hs_t[0] % 60)
+        gl.log_tick()
+
+    for _ in range(gl.STILL_WINDOW // 1000):
+        hs_fix(52.51 + hs_rnd.uniform(-1e-4, 1e-4), hs_rnd.uniform(0, 22))
+    check("HOME STAY: one calm minute is not a stay yet",
+          gl.log["still"]["active"] is False and gl.log["file"] == home_path)
+    for _ in range(gl.STILL_WINDOW // 1000 + 2):
+        hs_fix(52.51 + hs_rnd.uniform(-1e-4, 1e-4), hs_rnd.uniform(0, 22))
+    check("HOME STAY: two calm minutes close the track despite speed noise",
+          gl.log["still"]["active"] is True and gl.log["still"]["home"] is True
+          and gl.log["file"] is None and gl.log["batch"] == []
+          and home_path in gl.pending(),
+          "still=%s file=%s" % (gl.log["still"]["active"], gl.log["file"]))
+    n_files = len(gl.pending())
+    for _ in range(20 * 60):
+        hs_fix(52.51 + hs_rnd.uniform(-3e-4, 3e-4), hs_rnd.uniform(0, 22))
+    check("HOME STAY: 20 min of drift at home writes nothing",
+          gl.log["file"] is None and gl.log["batch"] == []
+          and len(gl.pending()) == n_files and gl.log["still"]["active"])
+    for i in range(1, 40):                          # drive away north, 6 m/s
+        hs_fix(52.51 + i * 5.4e-5, 20.0)
     resumed_path = gl.log["file"]
-    check("HOME STOP: resume after sustained speed and 60 m displacement",
-          gl.log["home_paused"] is False and resumed_path is not None
-          and bool(gl.log["batch"]),
-          "paused=%s moving_since=%s still_since=%s file=%s batch=%s" % (
-              gl.log["home_paused"], gl.log["home_moving_since"],
-              gl.log["home_still_since"], resumed_path, gl.log["batch"]))
-    points_after_resume = gl.log["points"] + len(gl.log["batch"])
-    _clock[0] += gl.HOME_MOVE_MAX_WAIT + 1000
-    gps_fix(52.5112, speed=8.0)
-    gl.st["time"] = "12:05:31"
-    gl.log_tick()
-    check("HOME STOP: confirmed movement keeps recording on home WiFi",
-          gl.log["home_motion_active"] is True
-          and gl.log["points"] + len(gl.log["batch"]) > points_after_resume,
-          "active=%s batch=%s" % (
-              gl.log["home_motion_active"], gl.log["batch"]))
+    first = gl.log["batch"][0].split(",") if gl.log["batch"] else None
+    check("HOME STAY: driving away opens a new track from the anchor",
+          gl.log["still"]["active"] is False and resumed_path is not None
+          and first is not None and abs(float(first[0]) - 52.51) < 3e-4,
+          "file=%s first=%r" % (resumed_path, first))
 
     gl.wifi["home"] = False
-    _clock[0] += gl.HOME_MOVE_CONFIRM
+    _clock[0] += 30000
     gl.st["pos_at"] = _clock[0]
     gl.st["hdop_at"] = _clock[0]
     gl.log_tick()
     _clock[0] += gl.NEW_FILE_GAP * 1000
-    gl.st["time"] = "12:05:01"
+    gl.st["time"] = "13:30:01"
+    gl.st["lat"] = 52.52
     gl.st["speed"] = 6.0
     gl.st["pos_at"] = _clock[0]
     gl.st["hdop_at"] = _clock[0]
@@ -2463,7 +2445,7 @@ try:
           len(seen) == 1 and len(disk) == 1,
           "seen=%s disk=%s points=%s" % (seen, disk, gl.log.get("points")))
 
-    # ROT-2: parking (MIN_MOVE) produces no new files
+    # ROT-2: parking produces no stream of files
     park_dir = os.path.join(tmpdir, "park")
     os.mkdir(park_dir)
     gl.LOG_DIR = park_dir
@@ -2484,9 +2466,16 @@ try:
         gl.log_tick()
     gl.flush()
     park_disk = [n for n in os.listdir(park_dir) if n.endswith(".trk")]
-    check("ROT-2: 1 h parked offline opens no file",
-          gl.log["file"] is None and park_disk == [],
-          "file=%s disk=%s" % (gl.log.get("file"), park_disk))
+    park_lines = []
+    for n in park_disk:
+        with open(os.path.join(park_dir, n)) as f:
+            park_lines += [l for l in f if l.count(",") == 4]
+    # a stay writes its anchor every STILL_HEARTBEAT, all into one file
+    check("ROT-2: 1 h parked offline is one file of anchor points",
+          len(park_disk) == 1 and len(park_lines) <= 14
+          and all(l.split(",")[2] == "" for l in park_lines),
+          "file=%s disk=%s lines=%d" % (gl.log.get("file"), park_disk,
+                                         len(park_lines)))
 
     # hotspot parking: first recorded point may open one file; age-rotate
     # closes it; MIN_MOVE must not open another
@@ -2969,51 +2958,6 @@ try:
                      hdop=1.0, hdop_at=_clock[0], status="A", quality=1,
                      fixtype=3, speed=speed)
 
-    def rv_drive(seconds, lat, speed=20.0, step=5.5e-5):
-        """One sample per second; step ≈ 6 m at 47.5° N (20 km/h)."""
-        for _ in range(seconds):
-            _clock[0] += gl.SAMPLE
-            lat += step if speed >= gl.HOME_STOP_SPEED else 0.0
-            rv_fix(lat, speed)
-            gl.log_tick()
-        return lat
-
-    def rv_points():
-        return gl.log["points"] + len(gl.log["batch"])
-
-    # REVIEW-1: the 30 s / 60 m movement gate only applies to a paused track
-    gl.wifi.update(state="connected", home=True)
-    lat = rv_drive(25, 47.5)
-    check("REVIEW-1: home WiFi, not paused: driving is recorded at once",
-          rv_points() == 25 and gl.log["home_paused"] is False,
-          "points=%s paused=%s" % (rv_points(), gl.log["home_paused"]))
-    lat = rv_drive(10, lat)
-    check("REVIEW-1: sustained movement still marks home motion active",
-          gl.log["home_motion_active"] is True
-          and gl.log["home_still_since"] is None)
-    lat = rv_drive(60, lat, speed=0.0)
-    before = rv_points()
-    lat = rv_drive(40, lat)
-    check("REVIEW-1: after a slow-down near home every sample is recorded",
-          rv_points() - before == 40 and gl.log["home_paused"] is False,
-          "new=%s" % (rv_points() - before))
-    check("REVIEW-1: confirmed movement resets the stop timer",
-          gl.log["home_still_since"] is None
-          and gl.log["home_motion_active"] is True)
-    lat = rv_drive(100, lat, speed=0.0)
-    check("REVIEW-1: stop timer counts from the new stop, not the old one",
-          gl.log["home_paused"] is False)
-    lat = rv_drive(21, lat, speed=0.0)
-    check("REVIEW-1: a full HOME_STOP_DELAY still pauses the track",
-          gl.log["home_paused"] is True and gl.log["file"] is None)
-    paused_pts = rv_points()
-    lat = rv_drive(10, lat)
-    check("REVIEW-1: a paused track still waits for confirmed movement",
-          gl.log["home_paused"] is True and rv_points() == paused_pts)
-    lat = rv_drive(25, lat)
-    check("REVIEW-1: paused track resumes after 30 s and 60 m",
-          gl.log["home_paused"] is False and gl.log["file"] is not None)
-
     # REVIEW-2: trailing comments on flag / IP / name keys
     env_p = os.path.join(rv_dir, "env")
     with open(env_p, "w") as f:
@@ -3138,141 +3082,6 @@ try:
     check("REVIEW-4: GGA quality 0 clears validity",
           gl.st["valid"] is False and gl.st["pos_at"] == fix_at)
 
-    # REVIEW2-1: stop timer restarted by real driving; resume keeps the
-    # samples seen while movement was being confirmed
-    def rv_home():
-        gl.reset()
-        gl.log_reset()
-        gl.wifi_reset()
-        gl.up_reset()
-        gl.wifi.update(state="connected", home=True)
-        for n in os.listdir(rv_dir):
-            os.remove(os.path.join(rv_dir, n))
-
-    rv_home()
-    lat = rv_drive(100, 47.5, speed=0.0)
-    lat = rv_drive(25, lat)
-    lat = rv_drive(1, lat, speed=0.0)
-    check("REVIEW2-1: 25 s of driving restarts the stop timer (no false pause)",
-          gl.log["home_paused"] is False and gl.log["file"] is not None,
-          "paused=%s file=%s" % (gl.log["home_paused"], gl.log["file"]))
-    lat = rv_drive(gl.HOME_STOP_DELAY // 1000, lat, speed=0.0)
-    check("REVIEW2-1: a full HOME_STOP_DELAY after that stop still pauses",
-          gl.log["home_paused"] is True)
-
-    rv_home()
-    lat = rv_drive(60, 47.5, speed=0.0)
-    still = gl.log["home_still_since"]
-    lat = rv_drive(15, lat, speed=8.0, step=0.0)    # speed noise, no movement
-    lat = rv_drive(1, lat, speed=0.0)
-    check("REVIEW2-1: sustained speed without displacement keeps the timer",
-          gl.log["home_still_since"] == still and still is not None)
-
-    rv_home()
-    lat = rv_drive(gl.HOME_STOP_DELAY // 1000 + 1, 47.5, speed=0.0)
-    check("REVIEW2-1: setup - track paused at home",
-          gl.log["home_paused"] is True and gl.log["file"] is None)
-    paused_pts = rv_points()
-    first_t = rv_sec[0]
-    lat = rv_drive(10, lat)
-    lat = rv_drive(gl.HOME_DIP_MAX // 1000 + 1, lat, speed=0.0)
-    check("REVIEW2-1: short movement while paused records nothing",
-          gl.log["home_paused"] is True and rv_points() == paused_pts
-          and gl.log["home_pending"] is None and gl.log["file"] is None)
-    first_t = rv_sec[0]
-    first_lat = lat + 5.5e-5
-    lat = rv_drive(35, lat)
-    first_line = gl.log["batch"][0] if gl.log["batch"] else ""
-    check("REVIEW2-1: resume keeps the confirmation samples (whole drive)",
-          gl.log["home_paused"] is False
-          and rv_points() - paused_pts >= 34,
-          "new=%s" % (rv_points() - paused_pts))
-    check("REVIEW2-1: resumed track starts where the car started moving",
-          first_line.startswith("%.6f," % first_lat)
-          and gl.log["file"].endswith("_%02d%02d%02d.trk" % (
-              12 + first_t // 3600, (first_t // 60) % 60, first_t % 60)),
-          "line=%r file=%s" % (first_line, gl.log["file"]))
-    n_before = rv_points()
-    lat = rv_drive(5, lat)
-    check("REVIEW2-1: recording continues normally after the resume",
-          rv_points() - n_before == 5)
-
-    rv_home()
-    lat = rv_drive(gl.HOME_STOP_DELAY // 1000 + 1, 47.5, speed=0.0)
-    lat = rv_drive(10, lat)
-    gl.wifi.update(state="offline", home=False)    # drove out of WiFi range
-    _clock[0] += gl.SAMPLE
-    rv_fix(lat + 5.5e-5, 20.0)
-    gl.log_tick()
-    check("REVIEW2-1: leaving home WiFi mid-confirmation keeps those samples",
-          gl.log["home_paused"] is False and len(gl.log["batch"]) >= 10
-          and gl.log["file"] is not None,
-          "batch=%s" % len(gl.log["batch"]))
-
-    rv_home()
-    gl.wifi.update(state="connected", home=True)
-    lat = rv_drive(gl.HOME_STOP_DELAY // 1000 + 1, 47.5, speed=0.0)
-    for i in range(gl.HOME_PENDING_MAX + 20):       # 8 m zig-zag, no 60 m
-        _clock[0] += gl.SAMPLE
-        rv_fix(lat + (7e-5 if i % 2 else 0.0), 10.0)
-        gl.log_tick()
-    pend = gl.log["home_pending"]
-    check("REVIEW2-1: pending samples are capped at HOME_PENDING_MAX",
-          gl.log["home_paused"] is True and pend is not None
-          and len(pend["lines"]) == gl.HOME_PENDING_MAX,
-          "pending=%s" % (None if pend is None else len(pend["lines"])))
-
-    # REVIEW3-1: stop-and-go near home (dips below 5 km/h shorter than
-    # HOME_DIP_MAX) neither breaks a resume nor pauses an active track
-    def rv_stop_and_go(seconds, lat, dip_every=8):
-        for i in range(seconds):
-            lat = rv_drive(1, lat, speed=(4.0 if i % dip_every == dip_every - 1
-                                          else 15.0), step=3.75e-5)
-        return lat
-
-    rv_home()
-    lat = rv_drive(gl.HOME_STOP_DELAY // 1000 + 1, 47.5, speed=0.0)
-    check("REVIEW3-1: setup - paused at home", gl.log["home_paused"] is True)
-    lat = rv_stop_and_go(60, lat)
-    check("REVIEW3-1: stop-and-go resumes a paused track",
-          gl.log["home_paused"] is False and rv_points() >= 50,
-          "paused=%s points=%s" % (gl.log["home_paused"], rv_points()))
-
-    rv_home()
-    lat = rv_drive(100, 47.5, speed=0.0)
-    lat = rv_stop_and_go(60, lat)
-    check("REVIEW3-1: stop-and-go after parking does not pause mid-drive",
-          gl.log["home_paused"] is False
-          and rv_points() == 1 + 60 - 60 // 8,     # every moving sample
-          "paused=%s points=%s" % (gl.log["home_paused"], rv_points()))
-
-    rv_home()
-    lat = rv_drive(gl.HOME_STOP_DELAY // 1000 + 1, 47.5, speed=0.0)
-    lat = rv_drive(8, lat)
-    for _ in range(3):                     # short fix gap inside the check
-        _clock[0] += gl.SAMPLE
-        gl.st["pos_at"] = _clock[0] - gl.STALE - 1
-        gl.log_tick()
-    pend = gl.log["home_pending"]
-    check("REVIEW3-1: a 3 s fix gap keeps the movement check and samples",
-          gl.log["home_moving_since"] is not None and pend is not None
-          and len(pend["lines"]) == 8)
-
-    rv_home()
-    lat = rv_drive(30, 47.5, speed=0.0)
-    lat = rv_drive(1, lat, speed=6.0, step=0.0)      # one spike
-    lat = rv_drive(gl.HOME_DIP_MAX // 1000 + 2, lat, speed=0.0)
-    check("REVIEW3-1: a speed spike does not delay or reset the stop timer",
-          gl.log["home_moving_since"] is None
-          and _clock[0] - gl.log["home_still_since"] >= 40000)
-
-    rv_home()
-    lat = rv_drive(100, 47.5, speed=0.0)
-    lat = rv_drive(20, lat)                          # resets the timer
-    lat = rv_drive(gl.HOME_STOP_DELAY // 1000 + 1, lat, speed=0.0)
-    check("REVIEW3-1: a real stop counts from the last fast sample",
-          gl.log["home_paused"] is True)
-
     # REVIEW3-2: a strong, visible candidate gets one immediate retry; the
     # fail / retry lines carry the raw status
     import contextlib
@@ -3342,6 +3151,203 @@ try:
           calls == ["home", "phone"] and w["ssid"] == "phone",
           "calls=%s" % calls)
     gl.wifi_reset()
+
+    # STAY: position-based stationary filter. Indoors the GPS speed is noise
+    # (measured on the board lying still: p50 5.4 km/h, max 22 km/h), so
+    # every fix below carries a random 0-22 km/h speed unless it is a drive.
+    import random
+    M_LAT = 1 / 111195.0                       # degrees per metre (lat)
+    M_LON = M_LAT / 0.6755                     # at 47.5° N
+    rnd = random.Random(1016)
+    NOISE = "noise"
+
+    def sv_reset(home=False):
+        gl.reset()
+        gl.log_reset()
+        gl.wifi_reset()
+        gl.up_reset()
+        gl.wifi.update(state="connected" if home else "offline", home=home)
+        for n in os.listdir(rv_dir):
+            os.remove(os.path.join(rv_dir, n))
+
+    def sv_fix(east, north, speed=NOISE, alt=100.0):
+        """Fix east/north metres from 47.5, 19.0; one SAMPLE later."""
+        if speed == NOISE:
+            speed = rnd.uniform(0, 22)
+        _clock[0] += gl.SAMPLE
+        sec = rv_sec[0]
+        rv_sec[0] += 1
+        gl.st.update(valid=True, date="2026-10-18",
+                     time="%02d:%02d:%02d" % (8 + sec // 3600,
+                                              (sec // 60) % 60, sec % 60),
+                     lat=47.5 + north * M_LAT, lon=19.0 + east * M_LON,
+                     alt=alt, pos_at=_clock[0], hdop=1.0, hdop_at=_clock[0],
+                     status="A", quality=1, fixtype=3, speed=speed)
+        gl.log_tick()
+
+    def sv_lines():
+        out = []
+        for n in sorted(os.listdir(rv_dir)):
+            if n.endswith(".trk"):
+                with open(os.path.join(rv_dir, n)) as f:
+                    out.extend(l for l in f if l.count(",") == 4)
+        return out + list(gl.log["batch"])
+
+    def sv_m(line):
+        f = line.split(",")
+        return gl._dist(47.5, 19.0, float(f[0]), float(f[1]))
+
+    def sv_drift(seconds, box=40.0, step=8.0, speed=NOISE):
+        """Indoor drift: a random walk within +-box m (p90 ~ box)."""
+        e = n = 0.0
+        for _ in range(seconds):
+            e = max(-box, min(box, e + rnd.uniform(-step, step)))
+            n = max(-box, min(box, n + rnd.uniform(-step, step)))
+            sv_fix(e, n, speed, alt=100 + rnd.uniform(-25, 25))
+
+    def sv_active():
+        return gl.log["still"]["active"]
+
+    # away from home: 30 min of indoor drift with speed noise
+    sv_reset()
+    sv_drift(150)
+    check("STAY: drift with 0-22 km/h speed noise becomes a stay in 2.5 min",
+          sv_active() is True and gl.log["still"]["home"] is False)
+    sv_drift(30 * 60 - 150)
+    gl.flush()
+    lines = sv_lines()
+    beats = [l for l in lines if l.split(",")[2] == ""]
+    # only the drift of the two windows that prove the stay can be on flash
+    check("STAY: 30 min of drift -> two minutes of it plus anchor points",
+          len(lines) <= 2 * gl.STILL_WINDOW // 1000 + 10 and sv_active(),
+          "lines=%d" % len(lines))
+    check("STAY: anchor on entry and every 5 min, without elevation",
+          len(beats) >= 6, "beats=%d" % len(beats))
+    if len(beats) >= 3:
+        ts = [l.strip().split(",")[4] for l in beats[1:3]]
+        gap = ((int(ts[1][9:11]) - int(ts[0][9:11])) * 3600
+               + (int(ts[1][11:13]) - int(ts[0][11:13])) * 60
+               + int(ts[1][13:15]) - int(ts[0][13:15]))
+        check("STAY: heartbeats are STILL_HEARTBEAT apart",
+              gl.STILL_HEARTBEAT // 1000 <= gap
+              <= gl.STILL_HEARTBEAT // 1000 + 2, "gap=%s" % gap)
+    a = gl.log["still"]["anchor"]
+    check("STAY: the anchor is the mean of the drift (< 15 m off)",
+          gl._dist(a[0], a[1], 47.5, 19.0) < 15.0,
+          "%.1f m" % gl._dist(a[0], a[1], 47.5, 19.0))
+
+    # excursions that turn back do not end the stay
+    n_before = len(sv_lines())
+    for m in (30, 55, 80, 95, 70, 40, 10):           # beyond the drift box
+        sv_fix(m, 0)
+    for m in (60, 120, 155, 162, 130, 60, 20):       # two samples past 150 m
+        sv_fix(0, m)
+    check("STAY: excursions that turn back keep the stay, write nothing",
+          sv_active() is True and len(sv_lines()) == n_before,
+          "active=%s new=%d" % (sv_active(), len(sv_lines()) - n_before))
+
+    # a real departure leaves and writes the way out from the anchor
+    for _ in range(5):
+        sv_fix(0, 0)
+    n_before = len(sv_lines())
+    for i in range(1, 41):                           # 20 km/h, 5.5 m/sample
+        sv_fix(i * 5.5, 0, 20.0)
+    new = sv_lines()[n_before:]
+    check("STAY: driving away ends the stay and keeps recording",
+          sv_active() is False and len(new) >= 38,
+          "active=%s new=%d" % (sv_active(), len(new)))
+    check("STAY: the departure is written from the anchor, not from 150 m",
+          bool(new) and sv_m(new[0]) < 15.0,
+          repr(new[0] if new else None))
+
+    # walking (1.4 m/s) is never a stay, even with the speed reading low
+    sv_reset()
+    for i in range(10 * 60):
+        sv_fix(i * 1.4, 0, 1.0)
+    check("STAY: a 10 min walk is never stationary, fully recorded",
+          sv_active() is False and len(sv_lines()) >= 190,     # MIN_MOVE 3 m
+          "points=%d" % len(sv_lines()))
+
+    # walking slowly away from a stay (1 m/s) leaves past STILL_EXIT
+    sv_reset()
+    sv_drift(150, box=10.0, step=3.0)
+    check("STAY: setup - stationary", sv_active() is True)
+    left = None
+    for i in range(1, 600):
+        sv_fix(i * 1.0, 0, 3.6)
+        if not sv_active():
+            left = i * 1.0
+            break
+    # the first STILL_NEAR m of a slow walk pass for drift and pull the
+    # anchor along, so it leaves somewhat past STILL_EXIT
+    check("STAY: a slow walk away leaves just past STILL_EXIT",
+          left is not None and gl.STILL_EXIT < left < gl.STILL_EXIT + 25,
+          "left at %s m" % left)
+
+    # no speed reading at all: the same, positions only
+    sv_reset()
+    sv_drift(200, speed=None)                # up to three windows
+    check("STAY: works without a speed reading", sv_active() is True)
+
+    # a traffic jam: two minutes within 30 m is a stay; driving on ends it
+    sv_reset()
+    for i in range(1, 21):
+        sv_fix(i * 5.5, 0, 20.0)
+    for i in range(130):
+        sv_fix(110 + i * 0.15, 0, 2.0)               # crawling ~20 m
+    check("STAY: a jam of two calm minutes is a stay", sv_active() is True)
+    for i in range(1, 40):
+        sv_fix(130 + i * 6.0, 0, 22.0)
+    check("STAY: driving on after the jam ends it", sv_active() is False)
+
+    # home network: arrive, stay, leave
+    sv_reset(home=True)
+    for i in range(-20, 1):                          # arriving at 20 km/h
+        sv_fix(i * 5.5, 0, 20.0)
+    arrived = len(sv_lines())
+    check("STAY: arriving home is recorded up to the stop", arrived >= 20,
+          "points=%d" % arrived)
+    home_file = gl.log["file"]
+    sv_drift(150)
+    check("STAY: a stay on the home network closes the track",
+          sv_active() and gl.log["still"]["home"] and gl.log["file"] is None
+          and home_file in gl.pending())
+    n_before = len(sv_lines())
+    sv_drift(30 * 60)
+    check("STAY: 30 min at home writes no points (no heartbeat)",
+          len(sv_lines()) == n_before and gl.log["file"] is None,
+          "new=%d" % (len(sv_lines()) - n_before))
+    for _ in range(5):
+        sv_fix(0, 0)
+    for i in range(1, 41):
+        sv_fix(0, i * 5.5, 20.0)
+    new = gl.log["batch"]
+    check("STAY: leaving home opens a new track from the anchor",
+          sv_active() is False and gl.log["file"] not in (None, home_file)
+          and bool(new) and sv_m(new[0]) < 15.0,
+          "file=%s first=%r" % (gl.log["file"], new[0] if new else None))
+    check("STAY: the new track is named after its first point",
+          bool(new) and gl.log["file"].endswith(
+              new[0].strip().split(",")[4].replace("T", "_")[:15] + ".trk"),
+          "file=%s first=%r" % (gl.log["file"], new[0] if new else None))
+
+    # driving past the home network without stopping is all recorded
+    sv_reset(home=True)
+    for i in range(300):
+        sv_fix(i * 6.0, 0, 22.0)
+    check("STAY: driving through home WiFi is never a stay",
+          sv_active() is False and len(sv_lines()) >= 290)
+
+    # home network lost during a stay: anchor points start, no resume
+    sv_reset(home=True)
+    sv_drift(150)
+    check("STAY: setup - home stay", sv_active() and gl.log["still"]["home"])
+    gl.wifi.update(state="offline", home=False)
+    sv_drift(11 * 60)
+    beats = [l for l in sv_lines() if l.split(",")[2] == ""]
+    check("STAY: home WiFi lost while staying -> heartbeats, still a stay",
+          sv_active() and gl.log["still"]["home"] is False
+          and 2 <= len(beats) <= 4, "beats=%d" % len(beats))
 
     # REVIEW2-2: a timestamp taken just after now is age 0, not "very old"
     now = _clock[0]
